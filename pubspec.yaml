@@ -1,0 +1,32 @@
+name: text
+description: "SoftBridge Texts - A feature-rich SMS/MMS app"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.8
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_sms_inbox: ^1.0.4
+  telephony: ^0.2.0
+  permission_handler: ^11.0.1
+  intl: ^0.18.1
+  flutter_local_notifications: ^17.0.0
+  google_fonts: ^6.1.0
+  flutter_contacts: ^1.1.9+2
+  shared_preferences: ^2.2.2
+  image_picker: ^1.0.4
+  path_provider: ^2.1.1
+  url_launcher: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
