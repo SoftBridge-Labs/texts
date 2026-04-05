@@ -6,15 +6,23 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Telephony
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import android.os.Bundle
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "in.softbridgelabs.text/default_sms"
     private var resultCallback: MethodChannel.Result? = null
     private val REQUEST_CODE_DEFAULT_SMS = 1001
     private var methodChannel: MethodChannel? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Block screenshots/screen mirror/sharing of content
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -25,6 +33,17 @@ class MainActivity: FlutterActivity() {
                 "requestDefaultSmsApp" -> {
                     resultCallback = result
                     requestDefaultSmsApp()
+                }
+                "getMessagesForAddress" -> {
+                    val address = call.argument<String>("address")
+                    if (address != null) {
+                        result.success(getMessagesForAddress(address))
+                    } else {
+                        result.error("INVALID_ARGUMENT", "Address is null", null)
+                    }
+                }
+                "getAllConversations" -> {
+                    result.success(getAllConversations())
                 }
                 "markSmsAsRead" -> {
                     val address = call.argument<String>("address")
@@ -66,6 +85,151 @@ class MainActivity: FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+
+    private fun getMessagesForAddress(address: String): List<Map<String, Any?>> {
+        val messages = mutableListOf<Map<String, Any?>>()
+        try {
+            // Find messages by address in system DB directly — much faster than querying all in first place
+            val uri = Uri.parse("content://sms")
+            val selection = "${Telephony.Sms.ADDRESS} = ?"
+            val selectionArgs = arrayOf(address)
+            val projection = arrayOf(
+                Telephony.Sms._ID,
+                Telephony.Sms.ADDRESS,
+                Telephony.Sms.BODY,
+                Telephony.Sms.DATE,
+                Telephony.Sms.TYPE,
+                Telephony.Sms.READ
+            )
+            val cursor = contentResolver.query(uri, projection, selection, selectionArgs, "${Telephony.Sms.DATE} DESC LIMIT 400")
+            cursor?.use { c ->
+                val idIdx = c.getColumnIndexOrThrow(Telephony.Sms._ID)
+                val addrIdx = c.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+                val bodyIdx = c.getColumnIndexOrThrow(Telephony.Sms.BODY)
+                val dateIdx = c.getColumnIndexOrThrow(Telephony.Sms.DATE)
+                val typeIdx = c.getColumnIndexOrThrow(Telephony.Sms.TYPE)
+                val readIdx = c.getColumnIndexOrThrow(Telephony.Sms.READ)
+
+                while (c.moveToNext()) {
+                    messages.add(mapOf(
+                        "id" to c.getInt(idIdx),
+                        "address" to c.getString(addrIdx),
+                        "body" to c.getString(bodyIdx),
+                        "date" to c.getLong(dateIdx),
+                        "type" to c.getInt(typeIdx),
+                        "read" to (c.getInt(readIdx) == 1)
+                    ))
+                }
+            }
+        } catch (e: Exception) {
+            // Log or ignore
+        }
+        return messages
+    }
+
+    private fun getAllConversations(): List<Map<String, Any?>> {
+        val conversations = mutableListOf<Map<String, Any?>>()
+        try {
+            // Using content://sms/conversations to leverage system-side grouping for speed
+            val uri = Uri.parse("content://sms/conversations")
+            val projection = arrayOf(
+                "snippet",
+                Telephony.Sms.ADDRESS,
+                Telephony.Sms.DATE,
+                Telephony.Sms.TYPE,
+                Telephony.Sms.READ,
+                Telephony.Sms.THREAD_ID
+            )
+            val cursor = contentResolver.query(uri, projection, null, null, "date DESC LIMIT 300")
+            
+            cursor?.use { c ->
+                val bodyIdx = c.getColumnIndex("snippet") // Conversations view uses 'snippet' for latest msg body
+                val addrIdx = c.getColumnIndex(Telephony.Sms.ADDRESS)
+                val dateIdx = c.getColumnIndex(Telephony.Sms.DATE)
+                val typeIdx = c.getColumnIndex(Telephony.Sms.TYPE)
+                val readIdx = c.getColumnIndex(Telephony.Sms.READ)
+                val threadIdx = c.getColumnIndex(Telephony.Sms.THREAD_ID)
+
+                while (c.moveToNext()) {
+                    val threadId = if (threadIdx != -1) c.getLong(threadIdx) else 0L
+                    var address = if (addrIdx != -1) c.getString(addrIdx) else null
+                    
+                    // If address is missing in the conversation view, we fetch the latest message details for this thread
+                    if (address == null && threadId != 0L) {
+                        try {
+                            val msgCursor = contentResolver.query(
+                                Uri.parse("content://sms"),
+                                arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.DATE),
+                                "${Telephony.Sms.THREAD_ID} = ?",
+                                arrayOf(threadId.toString()),
+                                "date DESC LIMIT 1"
+                            )
+                            msgCursor?.use { mc ->
+                                if (mc.moveToFirst()) {
+                                    address = mc.getString(0)
+                                }
+                            }
+                        } catch (_: Exception) {}
+                    }
+
+                    conversations.add(mapOf(
+                        "body" to (if (bodyIdx != -1) c.getString(bodyIdx) else ""),
+                        "address" to (address ?: "Unknown"),
+                        "date" to (if (dateIdx != -1) c.getLong(dateIdx) else System.currentTimeMillis()),
+                        "type" to (if (typeIdx != -1) c.getInt(typeIdx) else 1),
+                        "read" to (if (readIdx != -1) c.getInt(readIdx) == 1 else true),
+                        "thread_id" to threadId
+                    ))
+                }
+            }
+        } catch (e: Exception) {
+            // If the specialized query fails, fallback to a limited manual group logic
+            return getFallbackConversations()
+        }
+        return conversations
+    }
+
+    private fun getFallbackConversations(): List<Map<String, Any?>> {
+        val conversations = mutableListOf<Map<String, Any?>>()
+        val seenThreads = mutableSetOf<Long>()
+        try {
+            val uri = Uri.parse("content://sms")
+            val projection = arrayOf(
+                Telephony.Sms.BODY,
+                Telephony.Sms.ADDRESS,
+                Telephony.Sms.DATE,
+                Telephony.Sms.TYPE,
+                Telephony.Sms.READ,
+                Telephony.Sms.THREAD_ID
+            )
+            // Limit to last 300 messages for fallback to ensure performance
+            val cursor = contentResolver.query(uri, projection, null, null, "date DESC LIMIT 300")
+            cursor?.use { c ->
+                val bodyIdx = c.getColumnIndex(Telephony.Sms.BODY)
+                val addrIdx = c.getColumnIndex(Telephony.Sms.ADDRESS)
+                val dateIdx = c.getColumnIndex(Telephony.Sms.DATE)
+                val typeIdx = c.getColumnIndex(Telephony.Sms.TYPE)
+                val readIdx = c.getColumnIndex(Telephony.Sms.READ)
+                val threadIdx = c.getColumnIndex(Telephony.Sms.THREAD_ID)
+                
+                while (c.moveToNext()) {
+                    val threadId = c.getLong(threadIdx)
+                    if (!seenThreads.contains(threadId)) {
+                        seenThreads.add(threadId)
+                        conversations.add(mapOf(
+                            "body" to c.getString(bodyIdx),
+                            "address" to (c.getString(addrIdx) ?: "Unknown"),
+                            "date" to c.getLong(dateIdx),
+                            "type" to c.getInt(typeIdx),
+                            "read" to (c.getInt(readIdx) == 1),
+                            "thread_id" to threadId
+                        ))
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return conversations
     }
 
     private fun getAndClearSmsAddress(intent: Intent?): String? {
@@ -121,10 +285,17 @@ class MainActivity: FlutterActivity() {
         return try {
             val values = ContentValues()
             values.put(Telephony.Sms.READ, 1)
-            val uri = Uri.parse("content://sms")
+            values.put(Telephony.Sms.SEEN, 1)
+            val uri = Uri.parse("content://sms/inbox")
             val selection = "${Telephony.Sms.ADDRESS} = ? AND ${Telephony.Sms.READ} = 0"
             val selectionArgs = arrayOf(address)
-            contentResolver.update(uri, values, selection, selectionArgs)
+            val count = contentResolver.update(uri, values, selection, selectionArgs)
+            if (count == 0) {
+                // Fallback to general SMS table if inbox update did not affect any rows
+                contentResolver.update(Uri.parse("content://sms"), values, selection, selectionArgs)
+            } else {
+                count
+            }
         } catch (e: Exception) {
             0
         }

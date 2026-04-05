@@ -52,7 +52,15 @@ class NotificationService {
     );
 
     await androidImplementation?.createNotificationChannel(
-      const AndroidNotificationChannel(_otpChannelId, _otpChannelName, description: _otpChannelDescription, importance: Importance.max, enableVibration: true, playSound: true),
+      const AndroidNotificationChannel(
+        _otpChannelId, 
+        _otpChannelName, 
+        description: _otpChannelDescription, 
+        importance: Importance.max, 
+        enableVibration: true, 
+        playSound: true,
+        sound: RawResourceAndroidNotificationSound('otp_sms'),
+      ),
     );
 
     if (requestPermissions) {
@@ -99,7 +107,9 @@ class NotificationService {
         contentTitle: styledTitle,
         summaryText: "Secure OTP",
       ),
-      visibility: NotificationVisibility.public, // Show on lock screen so user can see it quickly
+      visibility: NotificationVisibility.public,
+      sound: const RawResourceAndroidNotificationSound('otp_sms'),
+      enableVibration: true,
       actions: <AndroidNotificationAction>[
         const AndroidNotificationAction('copy_otp', 'Copy Code', showsUserInterface: true),
       ],

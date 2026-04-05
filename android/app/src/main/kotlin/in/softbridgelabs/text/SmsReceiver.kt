@@ -1,6 +1,7 @@
 package `in`.softbridgelabs.text
 
 import android.app.AlarmManager
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -12,6 +13,7 @@ import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Build
 import android.provider.Telephony
+import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 import java.util.regex.Pattern
 
@@ -22,9 +24,9 @@ class SmsReceiver : BroadcastReceiver() {
         private const val CHANNEL_NAME = "SMS Notifications"
         private const val OTP_CHANNEL_ID = "otp_channel"
         private const val OTP_CHANNEL_NAME = "OTP Notifications"
-        private const val PREFS_NAME = "softbridge_texts_prefs"
-        private const val PREF_OTP_AUTO_DELETE = "otp_auto_delete_enabled"
-        private const val PREF_OTP_DELETE_MINUTES = "otp_delete_minutes"
+        private const val PREFS_NAME = "FlutterSharedPreferences"
+        private const val PREF_OTP_AUTO_DELETE = "flutter.otp_auto_delete_enabled"
+        private const val PREF_OTP_DELETE_MINUTES = "flutter.otp_delete_minutes"
         private const val DEFAULT_DELETE_MINUTES = 10
 
         // Regex patterns to detect OTP messages
@@ -38,7 +40,6 @@ class SmsReceiver : BroadcastReceiver() {
             for (pattern in OTP_PATTERNS) {
                 val matcher = pattern.matcher(body)
                 if (matcher.find()) {
-                    // Try group 1 first (captured digits)
                     val group = matcher.group(1)
                     if (group != null && group.length in 4..8) return group
                 }
@@ -53,15 +54,13 @@ class SmsReceiver : BroadcastReceiver() {
         if (intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION ||
             intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION
         ) {
+            val isDefaultSmsApp = Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
+            if (intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION && isDefaultSmsApp) return
+            if (intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION && !isDefaultSmsApp) return
+
             val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
             if (messages.isNullOrEmpty()) return
 
-            val isDefaultSmsApp = Telephony.Sms.getDefaultSmsPackage(context) == context.packageName
-            if (isDefaultSmsApp && intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION) {
-                saveIncomingMessages(context, messages)
-            }
-
-            // Group message parts by sender
             val grouped = mutableMapOf<String, StringBuilder>()
             for (msg in messages) {
                 val sender = msg.displayOriginatingAddress ?: "Unknown"
@@ -71,18 +70,25 @@ class SmsReceiver : BroadcastReceiver() {
             for ((sender, body) in grouped) {
                 val bodyStr = body.toString()
                 if (isOtpMessage(bodyStr)) {
+                    val messageId = if (isDefaultSmsApp && intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION) {
+                         saveIncomingMessages(context, messages)
+                    } else -1L
+                    
                     showOtpNotification(context, sender, bodyStr)
-                    scheduleOtpDeletion(context, sender, messages.firstOrNull()?.timestampMillis ?: System.currentTimeMillis())
+                    scheduleOtpDeletion(context, sender, messages.firstOrNull()?.timestampMillis ?: System.currentTimeMillis(), messageId)
                 } else {
+                    if (isDefaultSmsApp && intent.action == Telephony.Sms.Intents.SMS_DELIVER_ACTION) {
+                         saveIncomingMessages(context, messages)
+                    }
                     showNotification(context, sender, bodyStr)
                 }
             }
         }
     }
 
-    private fun saveIncomingMessages(context: Context, messages: Array<android.telephony.SmsMessage>) {
+    private fun saveIncomingMessages(context: Context, messages: Array<android.telephony.SmsMessage>): Long {
         val inboxUri = Uri.parse("content://sms/inbox")
-
+        var insertedId = -1L
         for (msg in messages) {
             try {
                 val values = ContentValues().apply {
@@ -93,17 +99,16 @@ class SmsReceiver : BroadcastReceiver() {
                     put(Telephony.Sms.SEEN, 0)
                     put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_INBOX)
                 }
-                context.contentResolver.insert(inboxUri, values)
-            } catch (_: Exception) {
-                // Keep notification delivery working even if provider write fails.
-            }
+                val uri = context.contentResolver.insert(inboxUri, values)
+                insertedId = uri?.lastPathSegment?.toLongOrNull() ?: insertedId
+            } catch (_: Exception) {}
         }
+        return insertedId
     }
 
-    private fun scheduleOtpDeletion(context: Context, address: String, timestamp: Long) {
+    private fun scheduleOtpDeletion(context: Context, address: String, timestamp: Long, messageId: Long) {
         val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val autoDeleteEnabled = prefs.getBoolean(PREF_OTP_AUTO_DELETE, true)
-        if (!autoDeleteEnabled) return
+        if (!prefs.getBoolean(PREF_OTP_AUTO_DELETE, true)) return
 
         val deleteMinutes = prefs.getInt(PREF_OTP_DELETE_MINUTES, DEFAULT_DELETE_MINUTES)
         val deleteAfterMs = deleteMinutes * 60 * 1000L
@@ -111,82 +116,91 @@ class SmsReceiver : BroadcastReceiver() {
         val deleteIntent = Intent(context, OtpDeleteReceiver::class.java).apply {
             putExtra("otp_address", address)
             putExtra("otp_timestamp", timestamp)
+            putExtra("otp_id", messageId)
         }
         val pendingIntent = PendingIntent.getBroadcast(
-            context,
-            (address + timestamp).hashCode(),
-            deleteIntent,
+            context, (address + timestamp).hashCode(), deleteIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val triggerAt = System.currentTimeMillis() + deleteAfterMs
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+            alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
         } else {
-            alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+            alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
         }
     }
 
-    private fun createChannels(notificationManager: NotificationManager) {
+    private fun createChannels(context: Context, notificationManager: NotificationManager) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val smsChannel = NotificationChannel(
-                CHANNEL_ID,
-                CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
+            val smsChannel = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Notifications for incoming SMS messages"
                 enableVibration(true)
             }
             notificationManager.createNotificationChannel(smsChannel)
 
-            val otpChannel = NotificationChannel(
-                OTP_CHANNEL_ID,
-                OTP_CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
+            val otpChannel = NotificationChannel(OTP_CHANNEL_ID, OTP_CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Secure OTP notifications"
                 enableVibration(true)
-                // Lock screen visibility: show nothing private on lock screen
                 lockscreenVisibility = NotificationCompat.VISIBILITY_PRIVATE
+                
+                // Custom sound for OTP notifications
+                val audioAttributes = android.media.AudioAttributes.Builder()
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                    .build()
+                val soundUri = android.net.Uri.parse("android.resource://" + context.packageName + "/" + R.raw.otp_sms)
+                setSound(soundUri, audioAttributes)
             }
             notificationManager.createNotificationChannel(otpChannel)
         }
     }
 
     private fun showOtpNotification(context: Context, sender: String, body: String) {
-        val notificationManager =
-            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        createChannels(notificationManager)
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        createChannels(context, notificationManager)
 
-        val otp = extractOtp(body) ?: body
+        val otp = extractOtp(body) ?: "------"
 
-        // Tap opens app, no extra sms_address so it lands on message list
+        // Intent to open app
         val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra("sms_address", sender)
         }
         val pendingIntent = PendingIntent.getActivity(
-            context,
-            sender.hashCode(),
-            openIntent,
+            context, sender.hashCode(), openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Intent to copy OTP
+        val copyIntent = Intent(context, OtpActionReceiver::class.java).apply {
+            action = "ACTION_COPY_OTP"
+            putExtra("otp_code", otp)
+            putExtra("otp_sender", sender)
+        }
+        val copyPendingIntent = PendingIntent.getBroadcast(
+            context, (sender + otp).hashCode(), copyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        // Custom Layout via RemoteViews
+        val remoteViews = RemoteViews(context.packageName, R.layout.notification_otp)
+        remoteViews.setTextViewText(R.id.otp_code, otp)
+        remoteViews.setTextViewText(R.id.notification_title, "OTP • $sender")
+        remoteViews.setTextViewText(R.id.otp_sender, "Don't share your OTP with anyone")
+        remoteViews.setOnClickPendingIntent(R.id.btn_copy, copyPendingIntent)
+
         val notification = NotificationCompat.Builder(context, OTP_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.sym_action_email)
-            .setContentTitle("Your OTP Code")
-            // Only show OTP value in content — no full body
-            .setContentText(otp)
-            .setStyle(NotificationCompat.BigTextStyle().bigText("Your one-time code: $otp"))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
-            // Prevent screenshot / screen-recording / mirroring of notification content
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            // Public version shown on lock screen — shows NOTHING sensitive
+            .setCustomContentView(remoteViews)
+            .setCustomBigContentView(remoteViews)
+            .setStyle(NotificationCompat.DecoratedCustomViewStyle())
             .setPublicVersion(
                 NotificationCompat.Builder(context, OTP_CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.sym_action_email)
@@ -194,28 +208,22 @@ class SmsReceiver : BroadcastReceiver() {
                     .setContentText("Tap to view your code")
                     .build()
             )
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setDefaults(Notification.DEFAULT_ALL)
             .build()
-
-        // FLAG_SECURE prevents this notification from appearing in screen recordings / mirroring
-        notification.flags = notification.flags or android.app.Notification.FLAG_NO_CLEAR
 
         notificationManager.notify(sender.hashCode(), notification)
     }
 
     private fun showNotification(context: Context, sender: String, body: String) {
-        val notificationManager =
-            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        createChannels(notificationManager)
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        createChannels(context, notificationManager)
 
         val openIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
             putExtra("sms_address", sender)
         }
         val pendingIntent = PendingIntent.getActivity(
-            context,
-            sender.hashCode(),
-            openIntent,
+            context, sender.hashCode(), openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -227,7 +235,7 @@ class SmsReceiver : BroadcastReceiver() {
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setDefaults(Notification.DEFAULT_ALL)
             .build()
 
         notificationManager.notify(sender.hashCode(), notification)

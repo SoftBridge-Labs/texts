@@ -1,13 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_sms_inbox/flutter_sms_inbox.dart';
 import 'package:telephony/telephony.dart' as tp;
 import 'package:intl/intl.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../notification_service.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_windowmanager/flutter_windowmanager.dart';
 import '../main.dart';
+import '../models/sms_data.dart';
 import '../widgets/custom_snackbar.dart';
 import '../widgets/custom_popup_menu.dart';
 import 'conversation_screen.dart';
@@ -24,15 +26,18 @@ class MessageListScreen extends StatefulWidget {
 
 class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindingObserver {
   static const platform = MethodChannel('in.softbridgelabs.text/default_sms');
-  final SmsQuery _query = SmsQuery();
   final tp.Telephony telephony = tp.Telephony.instance;
-  List<SmsMessage> _allMessages = [];
+  List<MessageData> _allMessages = [];
+  final Map<String, MessageData> _conversationByAddress = {};
   List<String> _filteredAddresses = [];
   bool _isSearching = false;
   final TextEditingController _searchController = TextEditingController();
   Timer? _refreshTimer;
   final Set<String> _locallyReadAddresses = {};
   bool _isSpamProtectionEnabled = true;
+  SharedPreferences? _prefs;
+  bool _isRefreshing = false;
+  int _lastCacheSignature = 0;
 
   final Set<String> _selectedAddresses = {};
   bool _isSelectionMode = false;
@@ -42,19 +47,45 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadSettings();
-    _checkDefaultSmsApp();
+    _requestPermissions();
 
-    _refreshTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+    // Set screenshot protection at the beginning — also handled by native FLAG_SECURE
+    FlutterWindowManager.addFlags(FlutterWindowManager.FLAG_SECURE);
+
+    _refreshTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!_isSelectionMode && !_isSearching) _refreshMessages();
     });
   }
 
   Future<void> _loadSettings() async {
-    final prefs = await SharedPreferences.getInstance();
+    _prefs = await SharedPreferences.getInstance();
     if (mounted) {
       setState(() {
-        _isSpamProtectionEnabled = prefs.getBool('spam_protection') ?? true;
+        _isSpamProtectionEnabled = _prefs?.getBool('spam_protection') ?? true;
       });
+      _loadCachedMessages().then((_) => _refreshMessages());
+    }
+  }
+
+  Future<void> _loadCachedMessages() async {
+    try {
+      final String? cachedJson = _prefs?.getString('cached_conversations_v1');
+      if (cachedJson != null) {
+        final List<dynamic> decoded = jsonDecode(cachedJson);
+        final List<MessageData> cachedMessages = decoded.map((m) => MessageData.fromMap(Map<String, dynamic>.from(m))).toList();
+        if (mounted && _allMessages.isEmpty) {
+          setState(() {
+            _allMessages = cachedMessages;
+            _conversationByAddress
+              ..clear()
+              ..addEntries(cachedMessages.map((m) => MapEntry(m.address ?? 'Unknown', m)));
+            _filterMessages(_searchController.text);
+            _lastCacheSignature = _computeSignature(cachedMessages);
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('Error loading cached messages: $e');
     }
   }
 
@@ -71,6 +102,42 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
     if (state == AppLifecycleState.resumed && !_isSelectionMode) {
       _refreshMessages();
     }
+  }
+
+  Future<void> _requestPermissions() async {
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.sms,
+      Permission.contacts,
+      if (Theme.of(context).platform == TargetPlatform.android) Permission.notification,
+    ].request();
+
+    if (statuses[Permission.sms]?.isGranted ?? false) {
+      _checkDefaultSmsApp();
+    } else if (statuses[Permission.sms]?.isPermanentlyDenied ?? false) {
+      if (mounted) {
+        _showPermissionSettingsDialog();
+      }
+    }
+  }
+
+  void _showPermissionSettingsDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Permissions Needed'),
+        content: const Text('SMS permission is required to display your messages. Please enable it in app settings.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('CANCEL')),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              openAppSettings();
+            },
+            child: const Text('OPEN SETTINGS'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _checkDefaultSmsApp() async {
@@ -103,7 +170,7 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
         actions: [
           TextButton(
             onPressed: () async {
-              final result = await platform.invokeMethod('requestDefaultSmsApp');
+              await platform.invokeMethod('requestDefaultSmsApp');
               if (mounted) {
                 Navigator.pop(dialogContext);
                 _initTelephony();
@@ -139,52 +206,93 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
   }
 
   Future<void> _refreshMessages() async {
+    if (_isRefreshing) return;
+    _isRefreshing = true;
     try {
-      final messages = await _query.querySms(
-        kinds: [SmsQueryKind.inbox, SmsQueryKind.sent],
-        sort: true,
-      );
+      // NEW: Native speedup — only get latest message per thread instead of querying entire inbox
+      final List<dynamic>? rawConversations = await platform.invokeMethod('getAllConversations');
+      if (rawConversations == null) return;
+      
+      final messages = rawConversations.map((c) {
+        final map = Map<String, dynamic>.from(c);
+        return MessageData.fromMap({
+          'id': map['thread_id']?.toString() ?? '0',
+          'address': map['address'] ?? 'Unknown',
+          'body': map['body'] ?? '',
+          'date': map['date'],
+          'type': map['type'],
+          'read': map['read'] ? 1 : 0,
+        });
+      }).toList();
+
+      final Map<String, MessageData> nextByAddress = {};
+      for (final msg in messages) {
+        final address = msg.address ?? 'Unknown';
+        nextByAddress.putIfAbsent(address, () => msg);
+      }
+
+      final nextMessages = nextByAddress.values.toList(growable: false);
+      final nextSignature = _computeSignature(nextMessages);
+
       if (mounted) {
         setState(() {
-          _allMessages = messages;
+          _allMessages = nextMessages;
+          _conversationByAddress
+            ..clear()
+            ..addAll(nextByAddress);
           _filterMessages(_searchController.text);
+
+          // Clean up locally read addresses that are now officially read in DB
+          for (final msg in nextMessages) {
+            if ((msg.read == true) && msg.address != null) {
+              _locallyReadAddresses.remove(msg.address);
+            }
+          }
         });
+        
+        // Cache only when content changed to avoid frequent IO churn.
+        if (_prefs != null && nextSignature != _lastCacheSignature) {
+          _lastCacheSignature = nextSignature;
+          final String encoded = jsonEncode(nextMessages.map((m) => m.toMap()).toList());
+          await _prefs!.setString('cached_conversations_v1', encoded);
+        }
       }
     } catch (e) {
       debugPrint('Error refreshing messages: $e');
+      // If native optimization fails, the old slow way would be a fallback.. but let's hope it doesn't.
+    } finally {
+      _isRefreshing = false;
     }
   }
 
-  DateTime _messageDate(SmsMessage message) {
-    return message.date ?? DateTime.fromMillisecondsSinceEpoch(0);
-  }
-
-  SmsMessage? _latestMessage(List<SmsMessage> messages) {
-    if (messages.isEmpty) return null;
-    return messages.reduce((current, next) {
-      return _messageDate(next).isAfter(_messageDate(current)) ? next : current;
-    });
+  int _computeSignature(List<MessageData> messages) {
+    var hash = messages.length;
+    for (final msg in messages) {
+      hash = 31 * hash + (msg.address?.hashCode ?? 0);
+      hash = 31 * hash + (msg.body?.hashCode ?? 0);
+      hash = 31 * hash + (msg.date?.millisecondsSinceEpoch ?? 0);
+      hash = 31 * hash + (msg.read == true ? 1 : 0);
+    }
+    return hash;
   }
 
   void _filterMessages(String query) {
-    final conversations = _getConversations(_allMessages);
     final settings = AppSettings();
-    List<String> addresses = conversations.keys.map((e) => e ?? 'Unknown').toList();
+    final normalizedQuery = query.toLowerCase();
+    List<String> addresses = _conversationByAddress.keys.toList(growable: false);
 
     addresses = addresses.where((addr) => !settings.blockedAddresses.contains(addr)).toList();
 
     if (query.isNotEmpty) {
       addresses = addresses
-          .where((address) => address.toLowerCase().contains(query.toLowerCase()))
+          .where((address) => address.toLowerCase().contains(normalizedQuery))
           .toList();
     }
 
     if (_isSpamProtectionEnabled) {
       addresses = addresses.where((address) {
-        final msgs = conversations[address == 'Unknown' ? null : address] ?? [];
-        final lastMsg = _latestMessage(msgs);
-        if (lastMsg == null) return true;
-        return !_isSpam(lastMsg.body ?? '', address);
+        final msg = _conversationByAddress[address];
+        return msg == null || !_isSpam(msg.body ?? '', address);
       }).toList();
     }
 
@@ -193,11 +301,9 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
       final bPinned = settings.pinnedAddresses.contains(b);
       if (aPinned != bPinned) return aPinned ? -1 : 1;
 
-      final aLatest = _latestMessage(conversations[a == 'Unknown' ? null : a] ?? []);
-      final bLatest = _latestMessage(conversations[b == 'Unknown' ? null : b] ?? []);
-      final aDate = aLatest != null ? _messageDate(aLatest) : DateTime.fromMillisecondsSinceEpoch(0);
-      final bDate = bLatest != null ? _messageDate(bLatest) : DateTime.fromMillisecondsSinceEpoch(0);
-      return bDate.compareTo(aDate);
+      final aMsg = _conversationByAddress[a];
+      final bMsg = _conversationByAddress[b];
+      return (bMsg?.date ?? DateTime(0)).compareTo(aMsg?.date ?? DateTime(0));
     });
 
     _filteredAddresses = addresses;
@@ -210,17 +316,6 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
       if (lowerBody.contains(keyword)) return true;
     }
     return false;
-  }
-
-  Map<String?, List<SmsMessage>> _getConversations(List<SmsMessage> messages) {
-    Map<String?, List<SmsMessage>> conversations = {};
-    for (var msg in messages) {
-      if (!conversations.containsKey(msg.address)) {
-        conversations[msg.address] = [];
-      }
-      conversations[msg.address]!.add(msg);
-    }
-    return conversations;
   }
 
   void _toggleSelection(String address) {
@@ -278,7 +373,6 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
   @override
   Widget build(BuildContext context) {
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
-    final conversations = _getConversations(_allMessages);
     final settings = AppSettings();
 
     return ListenableBuilder(
@@ -362,23 +456,38 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
             ],
           ),
           body: _allMessages.isEmpty
-              ? Center(child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.message_outlined, size: 64, color: Colors.grey.shade400),
-                    const SizedBox(height: 16),
-                    Text('No messages found', style: GoogleFonts.openSans(color: Colors.grey, fontSize: 16)),
-                  ],
-                ))
-              : ListView.separated(
+              ? RefreshIndicator(
+                  onRefresh: _refreshMessages,
+                  child: ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    children: [
+                      Padding(
+                        padding: EdgeInsets.only(top: MediaQuery.of(context).size.height * 0.3),
+                        child: Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.message_outlined, size: 64, color: Colors.grey.shade400),
+                              const SizedBox(height: 16),
+                              Text('No messages found', style: GoogleFonts.openSans(color: Colors.grey, fontSize: 16)),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              : RefreshIndicator(
+                  onRefresh: _refreshMessages,
+                  color: const Color(0xFF0078D4),
+                  backgroundColor: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+                  child: ListView.separated(
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   itemCount: _filteredAddresses.length,
                   separatorBuilder: (context, index) => const SizedBox(height: 4),
                   itemBuilder: (context, index) {
                     final address = _filteredAddresses[index];
-                    final msgs = conversations[address == 'Unknown' ? null : address] ?? [];
-                    if (msgs.isEmpty) return const SizedBox.shrink();
-                    final lastMsg = _latestMessage(msgs);
+                    final lastMsg = _conversationByAddress[address];
                     if (lastMsg == null) return const SizedBox.shrink();
 
                     final isPinned = settings.pinnedAddresses.contains(address);
@@ -485,8 +594,10 @@ class _MessageListScreenState extends State<MessageListScreen> with WidgetsBindi
                         ),
                       ),
                     );
+
                   },
                 ),
+              ),
           floatingActionButton: _isSelectionMode ? null : FloatingActionButton(
             onPressed: () async {
               await Navigator.push(context, MaterialPageRoute(builder: (c) => const NewMessageScreen()));

@@ -171,8 +171,10 @@ void backgroundMessageHandler(tp.SmsMessage message) async {
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await NotificationService.init(requestPermissions: true);
-  await AppSettings().load();
+  await Future.wait([
+    NotificationService.init(requestPermissions: true),
+    AppSettings().load(),
+  ]);
 
   NotificationService.onNotificationTap = _navigateToConversation;
 
@@ -195,7 +197,7 @@ Future<void> _checkInitialNotification() async {
   try {
     final String? address = await _platform.invokeMethod('getInitialSmsAddress');
     if (address != null && address.isNotEmpty) {
-      await Future.delayed(const Duration(milliseconds: 1000));
+      await Future.delayed(const Duration(milliseconds: 250));
       _navigateToConversation(address);
     }
   } catch (_) {}
@@ -258,7 +260,7 @@ class SoftBridgeTexts extends StatelessWidget {
           builder: (context, child) {
             return MediaQuery(
               data: MediaQuery.of(context).copyWith(
-                textScaleFactor: settings.fontSizeScale,
+                textScaler: TextScaler.linear(settings.fontSizeScale),
               ),
               child: child!,
             );

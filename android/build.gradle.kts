@@ -18,17 +18,17 @@ subprojects {
     val newSubprojectBuildDir: Directory = newBuildDir.dir(subproject.name)
     subproject.layout.buildDirectory.value(newSubprojectBuildDir)
 
-    // Fix for "Namespace not specified" in older plugins
-    subproject.plugins.whenPluginAdded {
-        if (this is com.android.build.gradle.LibraryPlugin || this is com.android.build.gradle.AppPlugin) {
-            val extension = subproject.extensions.findByName("android")
-            if (extension is com.android.build.gradle.BaseExtension) {
-                if (extension.namespace == null) {
-                    extension.namespace = when (subproject.name) {
-                        "telephony" -> "com.shounakmulay.telephony"
-                        "flutter_sms_inbox" -> "com.example.flutter_sms_inbox"
-                        else -> "in.softbridgelabs.text.${subproject.name.replace("-", "_")}"
-                    }
+    // Fix for "Namespace not specified" or incorrect "package" attribute in older plugins
+    subproject.afterEvaluate {
+        val extension = subproject.extensions.findByName("android")
+        if (extension is com.android.build.gradle.BaseExtension) {
+            // Force removal of package attribute by ensuring namespace is set in Gradle
+            if (extension.namespace == null) {
+                extension.namespace = when (subproject.name) {
+                    "telephony" -> "com.shounakmulay.telephony"
+                    "flutter_sms_inbox" -> "com.example.flutter_sms_inbox"
+                    "flutter_windowmanager" -> "io.adaptant.labs.flutter_windowmanager"
+                    else -> "in.softbridgelabs.text.${subproject.name.replace("-", "_")}"
                 }
             }
         }

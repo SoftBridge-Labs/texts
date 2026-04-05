@@ -5,7 +5,13 @@ import 'package:telephony/telephony.dart' as tp;
 import 'package:intl/intl.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_animate/flutter_animate.dart';
+import 'package:flutter_windowmanager/flutter_windowmanager.dart';
+import 'package:audioplayers/audioplayers.dart';
 import '../main.dart';
+import '../models/sms_data.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 import '../widgets/custom_snackbar.dart';
 import '../widgets/custom_popup_menu.dart';
 
@@ -23,15 +29,24 @@ class _ConversationScreenState extends State<ConversationScreen> {
   final tp.Telephony telephony = tp.Telephony.instance;
   final SmsQuery _query = SmsQuery();
   
-  List<SmsMessage> _currentMessages = [];
+  List<MessageData> _currentMessages = [];
   bool _isLoading = true;
 
   final Set<int> _selectedMessageIds = {};
   bool _isSelectionMode = false;
+  bool _showTick = false;
+
+  void _showSatisfyingTick() {
+    setState(() => _showTick = true);
+    Future.delayed(const Duration(milliseconds: 1500), () {
+      if (mounted) setState(() => _showTick = false);
+    });
+  }
 
   @override
   void initState() {
     super.initState();
+    FlutterWindowManager.addFlags(FlutterWindowManager.FLAG_SECURE);
     _loadMessages();
   }
 
@@ -40,27 +55,31 @@ class _ConversationScreenState extends State<ConversationScreen> {
     if (mounted) {
       setState(() {
         _currentMessages = messages;
-        _currentMessages.sort((a, b) {
-          final aDate = a.date ?? DateTime.fromMillisecondsSinceEpoch(0);
-          final bDate = b.date ?? DateTime.fromMillisecondsSinceEpoch(0);
-          return bDate.compareTo(aDate);
-        });
         _isLoading = false;
       });
     }
     _markAsRead();
   }
 
-  Future<List<SmsMessage>> _queryMessagesForAddress(String address) async {
+  Future<List<MessageData>> _queryMessagesForAddress(String address) async {
     try {
-      final allMessages = await _query.querySms(
-        kinds: [SmsQueryKind.inbox, SmsQueryKind.sent],
-        sort: true,
-      );
-      String normalize(String value) => value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9+]'), '');
-      final normalizedTarget = normalize(address);
-      return allMessages.where((m) => normalize(m.address ?? '') == normalizedTarget).toList();
+      // NEW: Highly optimized native query instead of Dart-side filtering
+      final List<dynamic>? rawMessages = await platform.invokeMethod('getMessagesForAddress', {'address': address});
+      if (rawMessages == null) return [];
+      
+      return rawMessages.map((m) {
+        final map = Map<String, dynamic>.from(m);
+        return MessageData.fromMap({
+          'id': map['id'].toString(),
+          'address': map['address'],
+          'body': map['body'],
+          'date': map['date'],
+          'type': map['type'],
+          'read': map['read'] ? 1 : 0,
+        });
+      }).toList();
     } catch (e) {
+      debugPrint('Error loading conversation: $e');
       return [];
     }
   }
@@ -79,8 +98,12 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
     try {
       await telephony.sendSms(to: widget.address, message: text);
+      
+      // Play satisfying sound
+      AudioPlayer().play(AssetSource('lib/sounds/send.mp3'));
+      
       if (mounted) {
-        CustomSnackbar.show(context, 'SMS send request submitted.', backgroundColor: Colors.green.shade600, icon: Icons.check_circle);
+        _showSatisfyingTick();
       }
       Future.delayed(const Duration(seconds: 2), _loadMessages);
     } catch (e) {
@@ -217,18 +240,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
       return;
     }
 
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('External Link'),
-        content: Text('Are you sure you want to open this link? Only open if you trust this source:\n\n$url'),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Open Link')),
-        ],
-      ),
-    );
-
+    final confirmed = await _scanAndConfirmLink(url);
     if (confirmed == true) {
       final uri = Uri.tryParse(url);
       if (uri != null && await canLaunchUrl(uri)) {
@@ -237,6 +249,74 @@ class _ConversationScreenState extends State<ConversationScreen> {
         if (mounted) CustomSnackbar.show(context, 'Could not open link', backgroundColor: Colors.redAccent);
       }
     }
+  }
+
+  Future<bool?> _scanAndConfirmLink(String url) async {
+    // Show Scanning Modal
+    final scanResult = await showDialog<Map<String, dynamic>?>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _ScanLoadingModal(url: url),
+    );
+
+    if (scanResult == null) return false;
+
+    final String verdict = scanResult['verdict'] ?? 'UNKNOWN';
+    final String emoji = scanResult['verdictEmoji'] ?? '🛡️';
+    final String finalUrl = scanResult['finalUrl'] ?? url;
+    final bool isSafe = verdict == 'SAFE';
+    final List<dynamic> reasons = scanResult['heuristics']?['reasons'] ?? [];
+
+    return showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+        title: Row(
+          children: [
+            Text(emoji, style: const TextStyle(fontSize: 28)),
+            const SizedBox(width: 12),
+            Expanded(child: Text(isSafe ? 'Looks Safe' : 'Security Warning', style: GoogleFonts.openSans(fontWeight: FontWeight.bold))),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(isSafe ? 'Our automated scan didn\'t find any immediate threats. Continue with caution.' : 'This link appears to be suspicious or potentially harmful.', 
+              style: GoogleFonts.openSans(fontSize: 14, color: isSafe ? Colors.grey.shade700 : Colors.red.shade800)),
+            if (reasons.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              ...reasons.map((r) => Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(children: [const Icon(Icons.warning_amber_rounded, size: 14, color: Colors.orange), const SizedBox(width: 8), Text(r.toString(), style: const TextStyle(fontSize: 12, color: Colors.orange))]),
+              )),
+            ],
+            const SizedBox(height: 16),
+            const Divider(),
+            const SizedBox(height: 8),
+            const Text('ORIGINAL LINK:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+            Text(url, style: const TextStyle(fontSize: 11, color: Colors.blue), maxLines: 1, overflow: TextOverflow.ellipsis),
+            if (finalUrl != url) ...[
+              const SizedBox(height: 8),
+              const Text('EXPANDED TO:', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.grey)),
+              Text(finalUrl, style: const TextStyle(fontSize: 11, color: Colors.red), maxLines: 1, overflow: TextOverflow.ellipsis),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCEL')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isSafe ? const Color(0xFF0078D4) : Colors.red,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            onPressed: () => Navigator.pop(ctx, true), 
+            child: Text(isSafe ? 'OPEN LINK' : 'PROCEED ANYWAY'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -309,18 +389,33 @@ class _ConversationScreenState extends State<ConversationScreen> {
                           _toggleMessageSelection(id);
                         }
                       },
-                      child: _buildMessageBubble(msg, isMe, isDark, isSelected),
+                      child: _buildMessageBubble(msg, msg.kind == SmsMessageKind.sent, isDark, isSelected),
                     );
                   },
                 ),
           ),
           if (!_isSelectionMode) _buildInputArea(isDark, isBlocked),
         ],
-      ),
+      ).animate(target: _showTick ? 1 : 0).blur(begin: Offset.zero, end: const Offset(4, 4), duration: 400.ms, curve: Curves.easeInOut),
+      floatingActionButton: _showTick ? Center(
+        child: Container(
+          width: 100,
+          height: 100,
+          decoration: BoxDecoration(
+            color: const Color(0xFF0078D4).withOpacity(0.9),
+            shape: BoxShape.circle,
+            boxShadow: [
+              BoxShadow(color: Colors.blue.withOpacity(0.3), blurRadius: 20, spreadRadius: 5)
+            ],
+          ),
+          child: const Icon(Icons.check_rounded, color: Colors.white, size: 60)
+        ).animate().scale(duration: 400.ms, curve: Curves.elasticOut).fadeOut(delay: 1000.ms),
+      ) : null,
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
     );
   }
 
-  Widget _buildMessageBubble(SmsMessage msg, bool isMe, bool isDark, bool isSelected) {
+  Widget _buildMessageBubble(MessageData msg, bool isMe, bool isDark, bool isSelected) {
     final text = msg.body ?? '';
     final urlRegExp = RegExp(r'https?://[^\s]+');
     final hasLinks = urlRegExp.hasMatch(text);
@@ -452,6 +547,112 @@ class _ConversationScreenState extends State<ConversationScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _ScanLoadingModal extends StatefulWidget {
+  final String url;
+  const _ScanLoadingModal({required this.url});
+
+  @override
+  State<_ScanLoadingModal> createState() => _ScanLoadingModalState();
+}
+
+class _ScanLoadingModalState extends State<_ScanLoadingModal> {
+  String _status = 'Initializing security scan...';
+  double _progress = 0.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _performScan();
+  }
+
+  Future<void> _performScan() async {
+    try {
+      setState(() { _status = 'Connecting to safety server...'; _progress = 0.2; });
+      await Future.delayed(const Duration(milliseconds: 600));
+
+      setState(() { _status = 'Checking URL reputation...'; _progress = 0.5; });
+      
+      final response = await http.post(
+        Uri.parse('https://api.softbridgelabs.in/api/texts/scan'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'url': widget.url}),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        setState(() { _status = 'Finalizing report...'; _progress = 0.9; });
+        await Future.delayed(const Duration(milliseconds: 400));
+        if (mounted) Navigator.pop(context, jsonDecode(response.body));
+      } else {
+        throw Exception('Server error: ${response.statusCode}');
+      }
+    } catch (e) {
+      if (mounted) Navigator.pop(context, null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 40),
+      child: Container(
+        padding: const EdgeInsets.all(24),
+        decoration: BoxDecoration(
+          color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+          borderRadius: BorderRadius.circular(32),
+          boxShadow: [
+            BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 20, spreadRadius: 5)
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Stack(
+              alignment: Alignment.center,
+              children: [
+                SizedBox(
+                  width: 80,
+                  height: 80,
+                  child: CircularProgressIndicator(
+                    value: _progress,
+                    strokeWidth: 8,
+                    strokeCap: StrokeCap.round,
+                    backgroundColor: Colors.blue.withOpacity(0.1),
+                    valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF0078D4)),
+                  ),
+                ).animate(onPlay: (c) => c.repeat()).rotate(duration: 3.seconds),
+                const Icon(Icons.security_rounded, size: 32, color: Color(0xFF0078D4))
+                  .animate(onPlay: (c) => c.repeat(reverse: true))
+                  .scale(begin: const Offset(0.8, 0.8), end: const Offset(1.2, 1.2), duration: 1.seconds),
+              ],
+            ),
+            const SizedBox(height: 24),
+            Text('Scaling URL Safety', 
+              style: GoogleFonts.openSans(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : Colors.black87)),
+            const SizedBox(height: 8),
+            Text(_status, 
+              textAlign: TextAlign.center,
+              style: GoogleFonts.openSans(fontSize: 14, color: Colors.grey)),
+            const SizedBox(height: 24),
+            Container(
+              width: double.infinity,
+              height: 4,
+              decoration: BoxDecoration(color: Colors.grey.withOpacity(0.1), borderRadius: BorderRadius.circular(2)),
+              child: FractionallySizedBox(
+                alignment: Alignment.centerLeft,
+                widthFactor: _progress,
+                child: Container(decoration: BoxDecoration(color: const Color(0xFF0078D4), borderRadius: BorderRadius.circular(2))),
+              ),
+            ).animate().shimmer(duration: 1.seconds, color: Colors.white.withOpacity(0.5)),
+          ],
+        ),
+      ).animate().scale(duration: 400.ms, curve: Curves.easeOutBack).fadeIn(),
     );
   }
 }

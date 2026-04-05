@@ -12,11 +12,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WRITE_SMS" />
     <uses-permission android:name="android.permission.READ_CELL_BROADCASTS" />
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:label="Texts"
@@ -75,12 +74,8 @@
         </receiver>
 
         <receiver android:name="com.shounakmulay.telephony.sms.IncomingSmsReceiver"
-            android:permission="android.permission.BROADCAST_SMS" android:exported="true">
-            <intent-filter>
-                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
-                <action android:name="android.provider.Telephony.SMS_DELIVER" />
-            </intent-filter>
-        </receiver>
+            android:permission="android.permission.BROADCAST_SMS" android:exported="true"
+            tools:node="remove" />
 
         <receiver android:name=".MmsReceiver"
             android:permission="android.permission.BROADCAST_WAP_PUSH"
@@ -94,6 +89,13 @@
         <receiver android:name=".OtpDeleteReceiver"
             android:exported="false" />
 
+        <receiver android:name=".OtpActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="ACTION_COPY_OTP" />
+            </intent-filter>
+        </receiver>
+
         <service android:name=".HeadlessSmsSendService"
             android:permission="android.permission.SEND_RESPOND_VIA_MESSAGE"
             android:exported="true">
@@ -106,6 +108,7 @@
                 <data android:scheme="mmsto" />
             </intent-filter>
         </service>
+
 
         <meta-data
             android:name="flutterEmbedding"
