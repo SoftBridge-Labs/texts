@@ -110,7 +110,10 @@ class SmsReceiver : BroadcastReceiver() {
         val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         if (!prefs.getBoolean(PREF_OTP_AUTO_DELETE, true)) return
 
-        val deleteMinutes = prefs.getInt(PREF_OTP_DELETE_MINUTES, DEFAULT_DELETE_MINUTES)
+        // Flutter's SharedPreferences stores integers as Long on Android. 
+        // We use a safe cast from Number to avoid ClassCastException.
+        val deleteMinutes = (prefs.all[PREF_OTP_DELETE_MINUTES] as? Number)?.toInt() ?: DEFAULT_DELETE_MINUTES
+
         val deleteAfterMs = deleteMinutes * 60 * 1000L
 
         val deleteIntent = Intent(context, OtpDeleteReceiver::class.java).apply {

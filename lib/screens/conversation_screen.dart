@@ -8,6 +8,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_windowmanager/flutter_windowmanager.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../main.dart';
 import '../models/sms_data.dart';
 import 'dart:convert';
@@ -28,13 +29,24 @@ class _ConversationScreenState extends State<ConversationScreen> {
   final TextEditingController _controller = TextEditingController();
   final tp.Telephony telephony = tp.Telephony.instance;
   final SmsQuery _query = SmsQuery();
-  
+  final ScrollController _scrollController = ScrollController();
+
   List<MessageData> _currentMessages = [];
   bool _isLoading = true;
+  bool _canReply = true;
 
   final Set<int> _selectedMessageIds = {};
   bool _isSelectionMode = false;
   bool _showTick = false;
+
+  // Pinch-to-zoom state
+  double _textScaleFactor = 1.0;
+  double _baseScaleFactor = 1.0;
+
+  // Smart replies
+  static const List<String> _smartReplies = [
+    'OK', 'Thanks!', 'Got it', 'On my way', 'Sure!', 'Will call you back', 'Not now', 'Noted 👍',
+  ];
 
   void _showSatisfyingTick() {
     setState(() => _showTick = true);
@@ -46,8 +58,27 @@ class _ConversationScreenState extends State<ConversationScreen> {
   @override
   void initState() {
     super.initState();
-    FlutterWindowManager.addFlags(FlutterWindowManager.FLAG_SECURE);
     _loadMessages();
+    _checkCanReply();
+    // Initialise zoom from saved prefs
+    final settings = AppSettings();
+    _textScaleFactor = settings.pinchToZoom ? settings.pinchZoomLevel : 1.0;
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _checkCanReply() async {
+    try {
+      final result = await platform.invokeMethod<bool>('canReplyToAddress', {'address': widget.address});
+      if (mounted) setState(() => _canReply = result ?? true);
+    } catch (_) {
+      setState(() => _canReply = true);
+    }
   }
 
   Future<void> _loadMessages() async {
@@ -63,10 +94,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
 
   Future<List<MessageData>> _queryMessagesForAddress(String address) async {
     try {
-      // NEW: Highly optimized native query instead of Dart-side filtering
       final List<dynamic>? rawMessages = await platform.invokeMethod('getMessagesForAddress', {'address': address});
       if (rawMessages == null) return [];
-      
       return rawMessages.map((m) {
         final map = Map<String, dynamic>.from(m);
         return MessageData.fromMap({
@@ -90,26 +119,94 @@ class _ConversationScreenState extends State<ConversationScreen> {
     } catch (_) {}
   }
 
-  void _sendMessage() async {
-    final String text = _controller.text.trim();
+  void _sendMessage([String? prefilled]) async {
+    final String text = prefilled ?? _controller.text.trim();
     if (text.isEmpty) return;
-
     _controller.clear();
-
     try {
       await telephony.sendSms(to: widget.address, message: text);
-      
-      // Play satisfying sound
       AudioPlayer().play(AssetSource('lib/sounds/send.mp3'));
-      
-      if (mounted) {
-        _showSatisfyingTick();
-      }
+      if (mounted) _showSatisfyingTick();
       Future.delayed(const Duration(seconds: 2), _loadMessages);
     } catch (e) {
       if (mounted) CustomSnackbar.show(context, 'Error: $e', backgroundColor: Colors.redAccent, icon: Icons.error_outline);
     }
   }
+
+  // ── Pinch-to-zoom ────────────────────────────────────────────────────────
+
+  void _onScaleStart(ScaleStartDetails d) {
+    _baseScaleFactor = _textScaleFactor;
+  }
+
+  void _onScaleUpdate(ScaleUpdateDetails d) {
+    final settings = AppSettings();
+    if (!settings.pinchToZoom) return;
+    final newScale = (_baseScaleFactor * d.scale).clamp(0.7, 2.5);
+    setState(() => _textScaleFactor = newScale);
+    settings.setPinchZoomLevel(newScale);
+  }
+
+  // ── Scheduled SMS ─────────────────────────────────────────────────────────
+
+  void _showScheduleDialog() {
+    DateTime picked = DateTime.now().add(const Duration(hours: 1));
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx2, setS) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: Text('Schedule Message', style: GoogleFonts.openSans(fontWeight: FontWeight.bold)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: _controller,
+                decoration: const InputDecoration(hintText: 'Type your message', border: OutlineInputBorder()),
+                maxLines: 3,
+              ),
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.schedule),
+                label: Text(DateFormat('MMM d, h:mm a').format(picked)),
+                onPressed: () async {
+                  final date = await showDatePicker(
+                    context: ctx, initialDate: picked,
+                    firstDate: DateTime.now(), lastDate: DateTime.now().add(const Duration(days: 365)),
+                  );
+                  if (date == null) return;
+                  final time = await showTimePicker(context: ctx, initialTime: TimeOfDay.fromDateTime(picked));
+                  if (time == null) return;
+                  setS(() => picked = DateTime(date.year, date.month, date.day, time.hour, time.minute));
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF0078D4), foregroundColor: Colors.white),
+              onPressed: () async {
+                final text = _controller.text.trim();
+                if (text.isEmpty) return;
+                await platform.invokeMethod('scheduleSms', {
+                  'address': widget.address,
+                  'body': text,
+                  'scheduledMs': picked.millisecondsSinceEpoch,
+                });
+                _controller.clear();
+                Navigator.pop(ctx);
+                if (mounted) CustomSnackbar.show(context, 'Message scheduled for ${DateFormat('MMM d, h:mm a').format(picked)}', backgroundColor: Colors.green, icon: Icons.schedule);
+              },
+              child: const Text('Schedule'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Selection ─────────────────────────────────────────────────────────────
 
   void _toggleMessageSelection(int? id) {
     if (id == null) return;
@@ -153,9 +250,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
         ],
       ),
     );
-
     if (confirmed != true) return;
-
     for (final id in _selectedMessageIds) {
       try {
         await platform.invokeMethod('deleteSmsMessage', {'id': id});
@@ -163,18 +258,15 @@ class _ConversationScreenState extends State<ConversationScreen> {
         debugPrint('Error deleting message $id: $e');
       }
     }
-
-    setState(() {
-      _selectedMessageIds.clear();
-      _isSelectionMode = false;
-    });
+    setState(() { _selectedMessageIds.clear(); _isSelectionMode = false; });
     _loadMessages();
   }
+
+  // ── Move to folder ────────────────────────────────────────────────────────
 
   void _showMoveChatDialog() {
     final settings = AppSettings();
     final folders = settings.folders.keys.toList();
-
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
@@ -195,7 +287,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
             if (folders.isEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 20),
-                child: Text('No folders created yet. Please create one in Custom Folders.', style: TextStyle(color: Colors.grey.shade600)),
+                child: Text('No folders yet. Create one in Custom Folders.', style: TextStyle(color: Colors.grey.shade600)),
               )
             else
               Flexible(
@@ -215,13 +307,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
                         if (id != null) settings.addToFolder(folders[i], widget.address, id);
                       }
                       Navigator.pop(context);
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Text('Saved to ${folders[i]}'),
-                          behavior: SnackBarBehavior.floating,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                        )
-                      );
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved to ${folders[i]}'), behavior: SnackBarBehavior.floating, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))));
                     },
                   ),
                 ),
@@ -233,13 +319,26 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
   }
 
+  // ── Link Handling ────────────────────────────────────────────────────────
+
   Future<void> _handleLink(String url) async {
     final settings = AppSettings();
     if (!settings.linksEnabled) {
       CustomSnackbar.show(context, 'Links are disabled. Enable them in Settings.', backgroundColor: Colors.orange.shade800, icon: Icons.link_off);
       return;
     }
-
+    // If link scanning is disabled, open directly
+    final prefs = await SharedPreferences.getInstance();
+    final scanEnabled = prefs.getBool('scan_links_enabled') ?? false;
+    if (!scanEnabled) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        if (mounted) CustomSnackbar.show(context, 'Could not open link', backgroundColor: Colors.redAccent);
+      }
+      return;
+    }
     final confirmed = await _scanAndConfirmLink(url);
     if (confirmed == true) {
       final uri = Uri.tryParse(url);
@@ -252,13 +351,11 @@ class _ConversationScreenState extends State<ConversationScreen> {
   }
 
   Future<bool?> _scanAndConfirmLink(String url) async {
-    // Show Scanning Modal
     final scanResult = await showDialog<Map<String, dynamic>?>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => _ScanLoadingModal(url: url),
     );
-
     if (scanResult == null) return false;
 
     final String verdict = scanResult['verdict'] ?? 'UNKNOWN';
@@ -271,18 +368,16 @@ class _ConversationScreenState extends State<ConversationScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-        title: Row(
-          children: [
-            Text(emoji, style: const TextStyle(fontSize: 28)),
-            const SizedBox(width: 12),
-            Expanded(child: Text(isSafe ? 'Looks Safe' : 'Security Warning', style: GoogleFonts.openSans(fontWeight: FontWeight.bold))),
-          ],
-        ),
+        title: Row(children: [
+          Text(emoji, style: const TextStyle(fontSize: 28)),
+          const SizedBox(width: 12),
+          Expanded(child: Text(isSafe ? 'Looks Safe' : 'Security Warning', style: GoogleFonts.openSans(fontWeight: FontWeight.bold))),
+        ]),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(isSafe ? 'Our automated scan didn\'t find any immediate threats. Continue with caution.' : 'This link appears to be suspicious or potentially harmful.', 
+            Text(isSafe ? "Our automated scan didn't find any immediate threats. Continue with caution." : 'This link appears to be suspicious or potentially harmful.',
               style: GoogleFonts.openSans(fontSize: 14, color: isSafe ? Colors.grey.shade700 : Colors.red.shade800)),
             if (reasons.isNotEmpty) ...[
               const SizedBox(height: 12),
@@ -306,12 +401,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('CANCEL')),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: isSafe ? const Color(0xFF0078D4) : Colors.red,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            ),
-            onPressed: () => Navigator.pop(ctx, true), 
+            style: ElevatedButton.styleFrom(backgroundColor: isSafe ? const Color(0xFF0078D4) : Colors.red, foregroundColor: Colors.white, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))),
+            onPressed: () => Navigator.pop(ctx, true),
             child: Text(isSafe ? 'OPEN LINK' : 'PROCEED ANYWAY'),
           ),
         ],
@@ -319,99 +410,138 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
   }
 
+  // ── Build ────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     final settings = AppSettings();
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
     final bool isBlocked = settings.blockedAddresses.contains(widget.address);
 
-    return Scaffold(
-      backgroundColor: isDark ? const Color(0xFF121212) : const Color(0xFFF8F9FA),
-      appBar: AppBar(
-        elevation: 0,
-        centerTitle: false,
-        leading: _isSelectionMode 
-          ? IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() {
-              _selectedMessageIds.clear();
-              _isSelectionMode = false;
-            }))
-          : null,
-        title: _isSelectionMode 
-          ? Text('${_selectedMessageIds.length} selected', style: GoogleFonts.openSans(fontWeight: FontWeight.w600))
-          : Text(widget.address, style: GoogleFonts.openSans(fontWeight: FontWeight.bold, fontSize: 18)),
-        backgroundColor: isDark ? const Color(0xFF1E1E1E) : Colors.white,
-        actions: _isSelectionMode ? [
-          IconButton(
-            icon: Icon(_selectedMessageIds.length == _currentMessages.length ? Icons.deselect : Icons.select_all), 
-            onPressed: _selectAllMessages,
-            tooltip: 'Select All',
-          ),
-          IconButton(icon: const Icon(Icons.delete_outline), onPressed: _deleteSelectedMessages),
-        ] : [
-          IconButton(
-            icon: const Icon(Icons.drive_file_move_outlined),
-            onPressed: _showMoveChatDialog,
-            tooltip: 'Move to Folder',
-          ),
-          CustomPopupMenuButton<String>(
-            child: const Icon(Icons.more_vert),
-            options: [
-              CustomPopupMenuOption(value: 'block', title: isBlocked ? 'Unblock' : 'Block', icon: isBlocked ? Icons.lock_open : Icons.block),
-            ],
-            onSelected: (val) {
-              if (val == 'block') {
-                settings.toggleBlock(widget.address);
-                CustomSnackbar.show(context, isBlocked ? 'Unblocked ${widget.address}' : 'Blocked ${widget.address}', icon: isBlocked ? Icons.lock_open : Icons.block);
-              }
-            },
-          )
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _isLoading 
-              ? const Center(child: CircularProgressIndicator())
-              : ListView.builder(
-                  reverse: true,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  itemCount: _currentMessages.length,
-                  itemBuilder: (context, index) {
-                    final msg = _currentMessages[index];
-                    final isMe = msg.kind == SmsMessageKind.sent;
-                    final id = int.tryParse(msg.id?.toString() ?? '');
-                    final isSelected = id != null && _selectedMessageIds.contains(id);
-                    
-                    return GestureDetector(
-                      onLongPress: () => _toggleMessageSelection(id),
-                      onTap: () {
-                        if (_isSelectionMode) {
-                          _toggleMessageSelection(id);
-                        }
-                      },
-                      child: _buildMessageBubble(msg, msg.kind == SmsMessageKind.sent, isDark, isSelected),
-                    );
-                  },
+    return ListenableBuilder(
+      listenable: settings,
+      builder: (ctx, _) {
+        return Scaffold(
+          backgroundColor: isDark ? const Color(0xFF121212) : const Color(0xFFF8F9FA),
+          appBar: AppBar(
+            elevation: 0,
+            centerTitle: false,
+            leading: _isSelectionMode
+              ? IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() { _selectedMessageIds.clear(); _isSelectionMode = false; }))
+              : null,
+            title: _isSelectionMode
+              ? Text('${_selectedMessageIds.length} selected', style: GoogleFonts.openSans(fontWeight: FontWeight.w600))
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(widget.address, style: GoogleFonts.openSans(fontWeight: FontWeight.bold, fontSize: 16)),
+                    if (!_canReply)
+                      Text('Read-only conversation', style: GoogleFonts.openSans(fontSize: 11, color: Colors.orange)),
+                  ],
                 ),
-          ),
-          if (!_isSelectionMode) _buildInputArea(isDark, isBlocked),
-        ],
-      ).animate(target: _showTick ? 1 : 0).blur(begin: Offset.zero, end: const Offset(4, 4), duration: 400.ms, curve: Curves.easeInOut),
-      floatingActionButton: _showTick ? Center(
-        child: Container(
-          width: 100,
-          height: 100,
-          decoration: BoxDecoration(
-            color: const Color(0xFF0078D4).withOpacity(0.9),
-            shape: BoxShape.circle,
-            boxShadow: [
-              BoxShadow(color: Colors.blue.withOpacity(0.3), blurRadius: 20, spreadRadius: 5)
+            backgroundColor: isDark ? const Color(0xFF1E1E1E) : Colors.white,
+            actions: _isSelectionMode ? [
+              IconButton(
+                icon: Icon(_selectedMessageIds.length == _currentMessages.length ? Icons.deselect : Icons.select_all),
+                onPressed: _selectAllMessages,
+                tooltip: 'Select All',
+              ),
+              IconButton(icon: const Icon(Icons.delete_outline), onPressed: _deleteSelectedMessages),
+            ] : [
+              IconButton(
+                icon: const Icon(Icons.drive_file_move_outlined),
+                onPressed: _showMoveChatDialog,
+                tooltip: 'Move to Folder',
+              ),
+              CustomPopupMenuButton<String>(
+                child: const Icon(Icons.more_vert),
+                options: [
+                  CustomPopupMenuOption(value: 'block', title: isBlocked ? 'Unblock' : 'Block', icon: isBlocked ? Icons.lock_open : Icons.block),
+                  if (settings.scheduledMessagesEnabled) CustomPopupMenuOption(value: 'schedule', title: 'Schedule Message', icon: Icons.schedule_outlined),
+                ],
+                onSelected: (val) {
+                  if (val == 'block') {
+                    settings.toggleBlock(widget.address);
+                    CustomSnackbar.show(context, isBlocked ? 'Unblocked ${widget.address}' : 'Blocked ${widget.address}', icon: isBlocked ? Icons.lock_open : Icons.block);
+                  } else if (val == 'schedule') {
+                    _showScheduleDialog();
+                  }
+                },
+              ),
             ],
           ),
-          child: const Icon(Icons.check_rounded, color: Colors.white, size: 60)
-        ).animate().scale(duration: 400.ms, curve: Curves.elasticOut).fadeOut(delay: 1000.ms),
-      ) : null,
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+          body: Column(
+            children: [
+              Expanded(
+                child: GestureDetector(
+                  onScaleStart: settings.pinchToZoom ? _onScaleStart : null,
+                  onScaleUpdate: settings.pinchToZoom ? _onScaleUpdate : null,
+                  child: _isLoading
+                    ? const Center(child: CircularProgressIndicator())
+                    : ListView.builder(
+                        controller: _scrollController,
+                        reverse: true,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                        itemCount: _currentMessages.length,
+                        itemBuilder: (context, index) {
+                          final msg = _currentMessages[index];
+                          final isMe = msg.kind == SmsMessageKind.sent;
+                          final id = int.tryParse(msg.id?.toString() ?? '');
+                          final isSelected = id != null && _selectedMessageIds.contains(id);
+                          return GestureDetector(
+                            onLongPress: () => _toggleMessageSelection(id),
+                            onTap: () { if (_isSelectionMode) _toggleMessageSelection(id); },
+                            child: _buildMessageBubble(msg, isMe, isDark, isSelected),
+                          );
+                        },
+                      ),
+                ),
+              ),
+              // Smart reply chips
+              if (!_isSelectionMode && _canReply && !isBlocked && settings.replySuggestions)
+                _buildSmartReplyBar(isDark),
+              if (!_isSelectionMode) _buildInputArea(isDark, isBlocked),
+            ],
+          ).animate(target: _showTick ? 1 : 0).blur(begin: Offset.zero, end: const Offset(4, 4), duration: 400.ms, curve: Curves.easeInOut),
+          floatingActionButton: _showTick ? Center(
+            child: Container(
+              width: 100, height: 100,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0078D4).withOpacity(0.9),
+                shape: BoxShape.circle,
+                boxShadow: [BoxShadow(color: Colors.blue.withOpacity(0.3), blurRadius: 20, spreadRadius: 5)],
+              ),
+              child: const Icon(Icons.check_rounded, color: Colors.white, size: 60),
+            ).animate().scale(duration: 400.ms, curve: Curves.elasticOut).fadeOut(delay: 1000.ms),
+          ) : null,
+          floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+        );
+      },
+    );
+  }
+
+  Widget _buildSmartReplyBar(bool isDark) {
+    return Container(
+      height: 48,
+      color: isDark ? const Color(0xFF1A1A1A) : const Color(0xFFF0F4FF),
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        itemCount: _smartReplies.length,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (ctx, i) => GestureDetector(
+          onTap: () => _sendMessage(_smartReplies[i]),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            decoration: BoxDecoration(
+              color: isDark ? const Color(0xFF2C2C2C) : Colors.white,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: const Color(0xFF0078D4).withOpacity(0.4)),
+            ),
+            child: Text(_smartReplies[i], style: GoogleFonts.openSans(fontSize: 13, color: const Color(0xFF0078D4))),
+          ),
+        ),
+      ),
     );
   }
 
@@ -427,7 +557,7 @@ class _ConversationScreenState extends State<ConversationScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
         decoration: BoxDecoration(
-          color: isSelected 
+          color: isSelected
             ? (isMe ? const Color(0xFF00569E) : (isDark ? const Color(0xFF3D3D3D) : const Color(0xFFE3F2FD)))
             : (isMe ? const Color(0xFF0078D4) : (isDark ? const Color(0xFF2C2C2C) : Colors.white)),
           borderRadius: BorderRadius.only(
@@ -445,12 +575,16 @@ class _ConversationScreenState extends State<ConversationScreen> {
           crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             if (!hasLinks)
-              Text(text, style: GoogleFonts.openSans(color: isMe ? Colors.white : (isDark ? Colors.white : Colors.black87), fontSize: 15))
+              Text(text,
+                style: GoogleFonts.openSans(
+                  color: isMe ? Colors.white : (isDark ? Colors.white : Colors.black87),
+                  fontSize: 15 * _textScaleFactor,
+                ))
             else
               _buildRichTextWithLinks(text, isMe, isDark),
             const SizedBox(height: 4),
-            Text(msg.date != null ? DateFormat('jm').format(msg.date!) : '', 
-                 style: TextStyle(fontSize: 10, color: isMe ? Colors.white70 : Colors.grey)),
+            Text(msg.date != null ? DateFormat('jm').format(msg.date!) : '',
+                style: TextStyle(fontSize: 10, color: isMe ? Colors.white70 : Colors.grey)),
           ],
         ),
       ),
@@ -460,52 +594,71 @@ class _ConversationScreenState extends State<ConversationScreen> {
   Widget _buildRichTextWithLinks(String text, bool isMe, bool isDark) {
     final List<InlineSpan> spans = [];
     final urlRegExp = RegExp(r'https?://[^\s]+');
-    
     int lastMatchEnd = 0;
     for (final match in urlRegExp.allMatches(text)) {
       if (match.start > lastMatchEnd) {
         spans.add(TextSpan(
           text: text.substring(lastMatchEnd, match.start),
-          style: GoogleFonts.openSans(color: isMe ? Colors.white : (isDark ? Colors.white : Colors.black87), fontSize: 15),
+          style: GoogleFonts.openSans(
+            color: isMe ? Colors.white : (isDark ? Colors.white : Colors.black87),
+            fontSize: 15 * _textScaleFactor),
         ));
       }
-      
       final url = match.group(0)!;
       spans.add(WidgetSpan(
         alignment: PlaceholderAlignment.middle,
         child: GestureDetector(
           onTap: () => _handleLink(url),
-          child: Text(
-            url,
+          child: Text(url,
             style: GoogleFonts.openSans(
               color: isMe ? Colors.lightBlue.shade100 : Colors.blue.shade700,
-              fontSize: 15,
+              fontSize: 15 * _textScaleFactor,
               decoration: TextDecoration.underline,
-            ),
-          ),
+            )),
         ),
       ));
       lastMatchEnd = match.end;
     }
-    
     if (lastMatchEnd < text.length) {
       spans.add(TextSpan(
         text: text.substring(lastMatchEnd),
-        style: GoogleFonts.openSans(color: isMe ? Colors.white : (isDark ? Colors.white : Colors.black87), fontSize: 15),
+        style: GoogleFonts.openSans(
+          color: isMe ? Colors.white : (isDark ? Colors.white : Colors.black87),
+          fontSize: 15 * _textScaleFactor),
       ));
     }
-
     return RichText(text: TextSpan(children: spans));
   }
 
   Widget _buildInputArea(bool isDark, bool isBlocked) {
-    if (isBlocked) return Container(
-      width: double.infinity,
-      padding: EdgeInsets.fromLTRB(16, 12, 16, MediaQuery.of(context).padding.bottom + 16),
-      color: Colors.red.withOpacity(0.05),
-      child: Text('This contact is blocked.', textAlign: TextAlign.center, style: GoogleFonts.openSans(color: Colors.red, fontWeight: FontWeight.bold)),
-    );
-    
+    if (isBlocked) {
+      return Container(
+        width: double.infinity,
+        padding: EdgeInsets.fromLTRB(16, 12, 16, MediaQuery.of(context).padding.bottom + 16),
+        color: Colors.red.withOpacity(0.05),
+        child: Text('This contact is blocked.', textAlign: TextAlign.center,
+            style: GoogleFonts.openSans(color: Colors.red, fontWeight: FontWeight.bold)),
+      );
+    }
+
+    // Read-only broadcast address — no reply box
+    if (!_canReply) {
+      return Container(
+        width: double.infinity,
+        padding: EdgeInsets.fromLTRB(16, 12, 16, MediaQuery.of(context).padding.bottom + 16),
+        color: Colors.orange.withOpacity(0.05),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(Icons.info_outline, color: Colors.orange, size: 16),
+            const SizedBox(width: 8),
+            Text('Replies are not supported for this sender.',
+              style: GoogleFonts.openSans(color: Colors.orange, fontSize: 13)),
+          ],
+        ),
+      );
+    }
+
     return Container(
       padding: EdgeInsets.fromLTRB(12, 8, 8, MediaQuery.of(context).padding.bottom + 12),
       decoration: BoxDecoration(
@@ -541,8 +694,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
             backgroundColor: const Color(0xFF0078D4),
             radius: 22,
             child: IconButton(
-              onPressed: _sendMessage, 
-              icon: const Icon(Icons.send_rounded, color: Colors.white, size: 20)
+              onPressed: _sendMessage,
+              icon: const Icon(Icons.send_rounded, color: Colors.white, size: 20),
             ),
           ),
         ],
@@ -550,6 +703,8 @@ class _ConversationScreenState extends State<ConversationScreen> {
     );
   }
 }
+
+// ── Scan Loading Modal ───────────────────────────────────────────────────────
 
 class _ScanLoadingModal extends StatefulWidget {
   final String url;
@@ -573,15 +728,12 @@ class _ScanLoadingModalState extends State<_ScanLoadingModal> {
     try {
       setState(() { _status = 'Connecting to safety server...'; _progress = 0.2; });
       await Future.delayed(const Duration(milliseconds: 600));
-
       setState(() { _status = 'Checking URL reputation...'; _progress = 0.5; });
-      
       final response = await http.post(
         Uri.parse('https://api.softbridgelabs.in/api/texts/scan'),
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({'url': widget.url}),
       ).timeout(const Duration(seconds: 10));
-
       if (response.statusCode == 200) {
         setState(() { _status = 'Finalizing report...'; _progress = 0.9; });
         await Future.delayed(const Duration(milliseconds: 400));
@@ -597,7 +749,6 @@ class _ScanLoadingModalState extends State<_ScanLoadingModal> {
   @override
   Widget build(BuildContext context) {
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
-
     return Dialog(
       backgroundColor: Colors.transparent,
       insetPadding: const EdgeInsets.symmetric(horizontal: 40),
@@ -606,9 +757,7 @@ class _ScanLoadingModalState extends State<_ScanLoadingModal> {
         decoration: BoxDecoration(
           color: isDark ? const Color(0xFF1E1E1E) : Colors.white,
           borderRadius: BorderRadius.circular(32),
-          boxShadow: [
-            BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 20, spreadRadius: 5)
-          ],
+          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.2), blurRadius: 20, spreadRadius: 5)],
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -617,12 +766,9 @@ class _ScanLoadingModalState extends State<_ScanLoadingModal> {
               alignment: Alignment.center,
               children: [
                 SizedBox(
-                  width: 80,
-                  height: 80,
+                  width: 80, height: 80,
                   child: CircularProgressIndicator(
-                    value: _progress,
-                    strokeWidth: 8,
-                    strokeCap: StrokeCap.round,
+                    value: _progress, strokeWidth: 8, strokeCap: StrokeCap.round,
                     backgroundColor: Colors.blue.withOpacity(0.1),
                     valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF0078D4)),
                   ),
@@ -633,20 +779,15 @@ class _ScanLoadingModalState extends State<_ScanLoadingModal> {
               ],
             ),
             const SizedBox(height: 24),
-            Text('Scaling URL Safety', 
-              style: GoogleFonts.openSans(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : Colors.black87)),
+            Text('Scanning URL Safety', style: GoogleFonts.openSans(fontWeight: FontWeight.bold, fontSize: 18, color: isDark ? Colors.white : Colors.black87)),
             const SizedBox(height: 8),
-            Text(_status, 
-              textAlign: TextAlign.center,
-              style: GoogleFonts.openSans(fontSize: 14, color: Colors.grey)),
+            Text(_status, textAlign: TextAlign.center, style: GoogleFonts.openSans(fontSize: 14, color: Colors.grey)),
             const SizedBox(height: 24),
             Container(
-              width: double.infinity,
-              height: 4,
+              width: double.infinity, height: 4,
               decoration: BoxDecoration(color: Colors.grey.withOpacity(0.1), borderRadius: BorderRadius.circular(2)),
               child: FractionallySizedBox(
-                alignment: Alignment.centerLeft,
-                widthFactor: _progress,
+                alignment: Alignment.centerLeft, widthFactor: _progress,
                 child: Container(decoration: BoxDecoration(color: const Color(0xFF0078D4), borderRadius: BorderRadius.circular(2))),
               ),
             ).animate().shimmer(duration: 1.seconds, color: Colors.white.withOpacity(0.5)),

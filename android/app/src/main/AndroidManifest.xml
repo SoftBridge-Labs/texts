@@ -16,6 +16,9 @@
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.RECEIVE_EMERGENCY_BROADCAST" />
 
     <application
         android:label="Texts"
@@ -93,6 +96,20 @@
             android:exported="false">
             <intent-filter>
                 <action android:name="ACTION_COPY_OTP" />
+            </intent-filter>
+        </receiver>
+
+        <receiver android:name=".ScheduledSmsReceiver"
+            android:exported="false" />
+
+        <!-- Wireless Emergency Alerts / Cell Broadcast -->
+        <receiver android:name=".EmergencyAlertReceiver"
+            android:exported="true"
+            android:permission="android.permission.RECEIVE_EMERGENCY_BROADCAST">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_CB_RECEIVED" />
+                <action android:name="android.provider.Telephony.SMS_EMERGENCY_CB_RECEIVED" />
+                <action android:name="android.provider.Telephony.SMS_SERVICE_CATEGORY_PROGRAM_DATA_RECEIVED" />
             </intent-filter>
         </receiver>
 

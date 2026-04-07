@@ -21,6 +21,11 @@ class AppSettings extends ChangeNotifier {
   double _fontSizeScale = 1.0;
   String _fontSizeName = 'Medium';
   bool _linksEnabled = false;
+  bool _pinchToZoom = false;
+  double _pinchZoomLevel = 1.0;
+  bool _replySuggestions = true;
+  bool _emergencyAlerts = true;
+  bool _scheduledMessages = true;
   
   Set<String> _pinnedAddresses = {};
   Set<String> _blockedAddresses = {};
@@ -31,6 +36,11 @@ class AppSettings extends ChangeNotifier {
   double get fontSizeScale => _fontSizeScale;
   String get fontSizeName => _fontSizeName;
   bool get linksEnabled => _linksEnabled;
+  bool get pinchToZoom => _pinchToZoom;
+  double get pinchZoomLevel => _pinchZoomLevel;
+  bool get replySuggestions => _replySuggestions;
+  bool get emergencyAlerts => _emergencyAlerts;
+  bool get scheduledMessagesEnabled => _scheduledMessages;
   Set<String> get pinnedAddresses => _pinnedAddresses;
   Set<String> get blockedAddresses => _blockedAddresses;
   Map<String, Map<String, List<int>>> get folders => _folders;
@@ -41,6 +51,11 @@ class AppSettings extends ChangeNotifier {
     _fontSizeName = prefs.getString('font_size') ?? 'Medium';
     _fontSizeScale = _getScale(_fontSizeName);
     _linksEnabled = prefs.getBool('links_enabled') ?? false;
+    _pinchToZoom = prefs.getBool('pinch_to_zoom_enabled') ?? false;
+    _pinchZoomLevel = prefs.getDouble('pinch_zoom_level') ?? 1.0;
+    _replySuggestions = prefs.getBool('reply_suggestions_enabled') ?? true;
+    _emergencyAlerts = prefs.getBool('emergency_alerts_enabled') ?? true;
+    _scheduledMessages = prefs.getBool('scheduled_messages_enabled') ?? true;
     
     _pinnedAddresses = (prefs.getStringList('pinned_addresses') ?? []).toSet();
     _blockedAddresses = (prefs.getStringList('blocked_addresses') ?? []).toSet();
@@ -82,6 +97,28 @@ class AppSettings extends ChangeNotifier {
     await prefs.setBool('links_enabled', enabled);
     notifyListeners();
   }
+
+  void setPinchToZoom(bool enabled) async {
+    _pinchToZoom = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('pinch_to_zoom_enabled', enabled);
+    notifyListeners();
+  }
+
+  void setPinchZoomLevel(double level) async {
+    _pinchZoomLevel = level;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('pinch_zoom_level', level);
+    notifyListeners();
+  }
+
+  void setReplySuggestions(bool enabled) async {
+    _replySuggestions = enabled;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('reply_suggestions_enabled', enabled);
+    notifyListeners();
+  }
+
 
   Future<void> togglePin(String address) async {
     if (_pinnedAddresses.contains(address)) {

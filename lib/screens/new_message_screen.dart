@@ -3,6 +3,8 @@ import 'package:flutter/services.dart';
 import 'package:telephony/telephony.dart' as tp;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
+import 'package:intl/intl.dart';
+
 
 class NewMessageScreen extends StatefulWidget {
   final String? initialMessage;
@@ -18,6 +20,8 @@ class _NewMessageScreenState extends State<NewMessageScreen> {
   final List<Contact> _selectedContacts = [];
   final List<String> _manualNumbers = [];
   bool _isSending = false;
+  DateTime? _scheduledDate;
+  static const _platform = MethodChannel('in.softbridgelabs.text/default_sms');
 
   @override
   void initState() {
@@ -83,16 +87,26 @@ class _NewMessageScreenState extends State<NewMessageScreen> {
     try {
       final String text = _messageController.text;
       for (final recipient in recipients) {
-        await tp.Telephony.instance.sendSms(
-          to: recipient,
-          message: text,
-        );
+        if (_scheduledDate == null) {
+          await tp.Telephony.instance.sendSms(
+            to: recipient,
+            message: text,
+          );
+        } else {
+          await _platform.invokeMethod('scheduleSms', {
+            'address': recipient,
+            'body': text,
+            'scheduledMs': _scheduledDate!.millisecondsSinceEpoch,
+          });
+        }
       }
       
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Message sent to ${recipients.length} recipient(s)'),
+            content: Text(_scheduledDate == null 
+              ? 'Message sent to ${recipients.length} recipient(s)'
+              : 'Message scheduled for ${DateFormat('MMM d, h:mm a').format(_scheduledDate!)}'),
             behavior: SnackBarBehavior.floating,
             backgroundColor: Colors.green.shade600,
           ),
@@ -106,6 +120,28 @@ class _NewMessageScreenState extends State<NewMessageScreen> {
     } finally {
       if (mounted) setState(() => _isSending = false);
     }
+  }
+
+  Future<void> _pickScheduleTime() async {
+    final DateTime? date = await showDatePicker(
+      context: context,
+      initialDate: DateTime.now().add(const Duration(minutes: 5)),
+      firstDate: DateTime.now(),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+    );
+    if (date == null) return;
+    if (!mounted) return;
+    final TimeOfDay? time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.now(),
+    );
+    if (time == null) return;
+    final schedule = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    if (schedule.isBefore(DateTime.now())) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Cannot schedule in the past')));
+      return;
+    }
+    setState(() => _scheduledDate = schedule);
   }
 
   @override
@@ -218,6 +254,24 @@ class _NewMessageScreenState extends State<NewMessageScreen> {
                           ),
                           maxLines: 8,
                           minLines: 3,
+                        ),
+                        const Divider(),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: Icon(Icons.schedule_rounded, 
+                            color: _scheduledDate != null ? const Color(0xFF0078D4) : Colors.grey),
+                          title: Text(_scheduledDate == null 
+                            ? 'Schedule message (optional)' 
+                            : 'Scheduled for: ${DateFormat('MMM d, h:mm a').format(_scheduledDate!)}',
+                            style: GoogleFonts.openSans(
+                              fontSize: 13, 
+                              color: _scheduledDate != null ? const Color(0xFF0078D4) : Colors.grey,
+                              fontWeight: _scheduledDate != null ? FontWeight.bold : FontWeight.normal
+                            )),
+                          trailing: _scheduledDate != null 
+                            ? IconButton(icon: const Icon(Icons.close_rounded, size: 20), onPressed: () => setState(() => _scheduledDate = null))
+                            : const Icon(Icons.chevron_right_rounded),
+                          onTap: _pickScheduleTime,
                         ),
                       ],
                     ),
